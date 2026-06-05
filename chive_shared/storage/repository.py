@@ -40,7 +40,7 @@ from chive_shared.storage.models import (
     RunRecord,
     TradeJournalEntry,
 )
-from utils.logging import get_logger
+from chive_shared.logging import get_logger
 
 logger = get_logger(__name__)
 

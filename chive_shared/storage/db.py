@@ -31,8 +31,8 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
-from config.settings import get_settings
-from utils.logging import get_logger
+from chive_shared.logging import get_logger
+from chive_shared.settings import get_storage_settings
 
 logger = get_logger(__name__)
 
@@ -45,7 +45,7 @@ def get_engine() -> AsyncEngine:
     Registers the pgvector asyncpg codec on every new connection so that
     Vector columns are correctly serialised/deserialised without explicit casts.
     """
-    settings = get_settings()
+    settings = get_storage_settings()
     engine = create_async_engine(
         settings.database_url,
         echo=False,
