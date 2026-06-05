@@ -14,4 +14,4 @@ Both downstream repos use `[tool.uv.sources]` editable overrides pointing here:
 chive-shared = { path = "../chive_shared", editable = true }
 ```
 
-Cloud deploys resolve from `git+https://github.com/zhexu/chive_shared@v0.1.0`.
+Cloud deploys resolve from `git+https://github.com/xuzhe0205/chive_shared@v0.1.0`.

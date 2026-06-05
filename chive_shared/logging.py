@@ -45,6 +45,10 @@ class _KwargsLogger:
     def exception(self, event: str, **kwargs: Any) -> None:
         self._log.exception(self._format(event, kwargs))
 
+    def critical(self, event: str, **kwargs: Any) -> None:
+        if self._log.isEnabledFor(logging.CRITICAL):
+            self._log.critical(self._format(event, kwargs))
+
 
 def get_logger(name: str) -> _KwargsLogger:
     """Return a stdlib-backed logger with structlog-compatible keyword API."""
