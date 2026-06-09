@@ -36,7 +36,7 @@ from sqlalchemy import (
     UniqueConstraint,
     text,
 )
-from sqlalchemy.dialects.postgresql import JSON, UUID
+from sqlalchemy.dialects.postgresql import ARRAY, JSON, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -326,6 +326,9 @@ class RunIntent(Base):
     portfolio: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     status: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
     universe: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    custom_tickers: Mapped[Optional[list[str]]] = mapped_column(
+        ARRAY(String(16)), nullable=True, default=None,
+    )
     session_label: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
     requested_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False,
