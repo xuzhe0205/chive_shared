@@ -30,6 +30,7 @@ from sqlalchemy import (
     Date,
     DateTime,
     Float,
+    ForeignKey,
     Integer,
     String,
     Text,
@@ -42,42 +43,6 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 class Base(DeclarativeBase):
     pass
-
-
-class RunRecord(Base):
-    """
-    One row per pipeline run.
-
-    Created at run start (state=pending), updated to complete/failed at end.
-    The source-of-truth for run history queries.
-    """
-
-    __tablename__ = "runs"
-
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
-    )
-    run_id: Mapped[str] = mapped_column(String(36), nullable=False, unique=True, index=True)
-    session_type: Mapped[str] = mapped_column(
-        String(20), nullable=False
-    )  # "pre-market" | "after-close" | "manual"
-    trigger_type: Mapped[str] = mapped_column(
-        String(30), nullable=False
-    )  # TriggerType.value
-    started_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False
-    )
-    completed_at: Mapped[Optional[datetime]] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
-    status: Mapped[str] = mapped_column(
-        String(20), nullable=False, default="pending"
-    )  # RunState.value
-    error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    universe_size: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    portfolio_size: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    action_item_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    total_cost_usd: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
 
 
 class AgentArtifact(Base):
@@ -151,7 +116,12 @@ class RunEvent(Base):
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
-    run_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True, index=True)
+    run_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("runs.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
     agent_name: Mapped[str] = mapped_column(String(64), nullable=False)
     ticker: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
     model_used: Mapped[str] = mapped_column(String(64), nullable=False)
@@ -181,8 +151,10 @@ class RunDigestRecord(Base):
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
-    run_id: Mapped[str] = mapped_column(
-        String(36), nullable=False, unique=True, index=True
+    run_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("runs.id", ondelete="CASCADE"),
+        nullable=False, unique=True, index=True,
     )
     digest_json: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     formatted_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
@@ -306,16 +278,26 @@ class TradeJournalEntry(Base):
     )
 
 
-class RunIntent(Base):
-    """M33 / V2 — Cloud-to-local run trigger intents.
+class Run(Base):
+    """Unified pipeline run record (v0.4.0).
 
-    Written by the cloud webserver when a user clicks "Trigger run" in the UI.
-    Polled by the local ChiveDaemon every ~30s. Drives the run lifecycle state
-    machine — see docs/superpowers/specs/2026-05-31-chive-v2-rhea-integration-design.md
+    Collapses the previous RunRecord + RunIntent split into one row per
+    pipeline run. `id` (UUID) is the only identity — child tables FK on it.
+
+    Lifecycle:
+      Daemon path (V2 cloud trigger):
+        cloud inserts row with status='PENDING_START' →
+        local daemon transitions STARTING → RUNNING → COMPLETE/FAILED.
+      Standalone path (cron, direct CLI, daemon-startup):
+        pipeline inserts row directly with status='RUNNING'.
+
+    The status check constraint covers BOTH paths' historical states.
+
+    See docs/superpowers/specs/2026-05-31-chive-v2-rhea-integration-design.md
     Section 11.1 for the full state diagram.
     """
 
-    __tablename__ = "run_intents"
+    __tablename__ = "runs"
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
@@ -342,9 +324,22 @@ class RunIntent(Base):
     completed_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True), nullable=True,
     )
-    run_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True, index=True)
     error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     failure_reason: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+
+    # ── Columns absorbed from the legacy RunRecord (pre-v0.4.0) ─────────────
+    # All nullable — older intent-only rows didn't populate these.
+    trigger_type: Mapped[Optional[str]] = mapped_column(String(30), nullable=True)
+    session_type: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    universe_size: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    portfolio_size: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    action_item_count: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    total_cost_usd: Mapped[Optional[float]] = mapped_column(
+        Float, nullable=True, default=0.0,
+    )
+    started_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
 
     __table_args__ = (
         CheckConstraint(
@@ -353,7 +348,7 @@ class RunIntent(Base):
             "'PENDING_STOP','STOPPING','CANCELLED',"
             "'PENDING_FORCE_STOP','STALE'"
             ")",
-            name="ck_run_intents_status",
+            name="ck_runs_status",
         ),
     )
 
@@ -385,3 +380,12 @@ class DaemonStatus(Base):
         default=lambda: datetime.now(UTC),
         server_default=text("now()"),
     )
+
+
+# ── Backwards-compatibility aliases (v0.4.0 unified-runs refactor) ───────────
+# RunIntent was renamed to Run; RunRecord was deleted (its columns absorbed).
+# These aliases let downstream code (chive pipeline, chive-backend) keep their
+# old imports working until they migrate to `Run` in subsequent commits
+# (M35 steps 2-5).
+RunIntent = Run
+RunRecord = Run

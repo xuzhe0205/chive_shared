@@ -7,7 +7,8 @@ Each repository is scoped to an AsyncSession injected at construction time.
 Callers obtain a session via storage.db.get_session() and pass it in.
 
 Repositories:
-  RunRepository            — pipeline run lifecycle (RunRecord)
+  RunRepository            — pipeline run lifecycle (Run; replaces v0.3 split
+                              of RunRecord + RunIntent)
   AgentArtifactRepository  — per-agent outputs + vector embeddings (AgentArtifact)
   RunEventRepository       — AuditLogger write path (RunEvent)
   RunDigestRepository      — serialised FinalRecommendation (RunDigestRecord)
@@ -24,6 +25,7 @@ Artifact lifecycle (two-tier RAG memory):
   RAG_ARCHIVE_RETENTION_DAYS is set (default: None = keep forever).
 """
 
+import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -35,49 +37,162 @@ from chive_shared.storage.models import (
     AgentArtifact,
     ApiCall,
     DataProvenance,
+    Run,
     RunDigestRecord,
     RunEvent,
-    RunRecord,
     TradeJournalEntry,
 )
 from chive_shared.logging import get_logger
 
+
+def _to_uuid(value: "str | uuid.UUID") -> uuid.UUID:
+    """Coerce a string-or-UUID identifier to UUID.
+
+    Used at the boundary of every repo method that takes a run_id, since the
+    pipeline still passes raw strings while chive-backend passes UUIDs.
+    """
+    return value if isinstance(value, uuid.UUID) else uuid.UUID(str(value))
+
 logger = get_logger(__name__)
 
 
-# ── Run repository ────────────────────────────────────────────────────────────
+# ── Run repository (v0.4.0 unified runs) ─────────────────────────────────────
+
+# Terminal statuses (uppercase, matches the v0.4.0 check constraint).
+_TERMINAL_STATUSES = ("COMPLETE", "FAILED", "CANCELLED", "STALE")
+
 
 class RunRepository:
-    """Persists and retrieves RunRecord rows."""
+    """Persists and retrieves Run rows (v0.4.0 unified model).
+
+    Replaces the previous RunRepository (RunRecord) + IntentRepository
+    (RunIntent) split. The Run table is the single source of truth.
+
+    The `run_id` parameter accepted by every method is a UUID — either as a
+    `uuid.UUID` instance or the canonical 36-char string form. Strings are
+    coerced via `_to_uuid()` at the boundary, so existing call sites that
+    pass `str(uuid)` keep working.
+    """
 
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
 
-    async def save(self, record: RunRecord) -> None:
-        """Insert or merge a RunRecord (upsert by run_id)."""
+    async def save(self, record: Run) -> None:
+        """Insert or merge a Run row.
+
+        The caller is expected to have populated `id`, `status`, and `portfolio`.
+        For row-creation in modern code prefer `upsert_run_start()` which
+        also handles the daemon-vs-standalone bifurcation.
+        """
         self._session.add(record)
-        logger.debug("run_saved", run_id=record.run_id, status=record.status)
+        logger.debug("run_saved", run_id=str(record.id), status=record.status)
+
+    async def upsert_run_start(
+        self,
+        *,
+        run_id: "uuid.UUID | str",
+        portfolio: str,
+        session_label: str,
+        trigger_type: str,
+        session_type: str,
+        started_at: datetime,
+        universe: str | None = None,
+        custom_tickers: list[str] | None = None,
+        universe_size: int = 0,
+        portfolio_size: int = 0,
+    ) -> Run:
+        """Transition (or create) a run into RUNNING state.
+
+        Standalone path (cron / direct CLI / daemon-startup pipeline):
+          No row pre-exists. INSERT a new Run with status='RUNNING' and all
+          metadata populated.
+
+        Daemon path (V2 cloud-trigger):
+          chive-backend already inserted the row at trigger time with
+          status='PENDING_START'. UPDATE in place: status → 'RUNNING',
+          started_at, trigger_type, session_type populated, etc.
+
+        Returns the Run row in its new RUNNING state. Idempotent — calling
+        twice with the same run_id from the standalone path is a safe no-op
+        (the second call sees status='RUNNING' and just refreshes
+        started_at / metadata).
+        """
+        rid = _to_uuid(run_id)
+        result = await self._session.execute(
+            select(Run).where(Run.id == rid).with_for_update()
+        )
+        run = result.scalar_one_or_none()
+
+        if run is None:
+            # Standalone path — INSERT.
+            run = Run(
+                id=rid,
+                portfolio=portfolio,
+                status="RUNNING",
+                universe=universe,
+                custom_tickers=custom_tickers,
+                session_label=session_label,
+                requested_at=started_at,
+                picked_up_at=started_at,
+                trigger_type=trigger_type,
+                session_type=session_type,
+                started_at=started_at,
+                universe_size=universe_size,
+                portfolio_size=portfolio_size,
+            )
+            self._session.add(run)
+            logger.debug(
+                "run_started_standalone", run_id=str(rid), trigger_type=trigger_type,
+            )
+        else:
+            # Daemon path — UPDATE the existing PENDING_START row.
+            run.status = "RUNNING"
+            run.started_at = started_at
+            run.trigger_type = trigger_type
+            run.session_type = session_type
+            if run.picked_up_at is None:
+                run.picked_up_at = started_at
+            if universe and run.universe is None:
+                run.universe = universe
+            if custom_tickers and not run.custom_tickers:
+                run.custom_tickers = custom_tickers
+            if universe_size and not run.universe_size:
+                run.universe_size = universe_size
+            if portfolio_size and not run.portfolio_size:
+                run.portfolio_size = portfolio_size
+            logger.debug(
+                "run_started_daemon", run_id=str(rid), trigger_type=trigger_type,
+            )
+
+        return run
 
     async def update_status(
         self,
-        run_id: str,
+        run_id: "uuid.UUID | str",
         status: str | None = None,
         completed_at: datetime | None = None,
         error: str | None = None,
         action_item_count: int = 0,
         total_cost_usd: float | None = None,
     ) -> None:
-        """Update run status fields in-place. Pass status=None to skip the status column."""
+        """Update run status fields in-place.
+
+        `status` is normalized to uppercase to match the v0.4.0 check constraint
+        (the legacy RunRecord accepted lowercase values like 'complete').
+
+        Pass status=None to skip the status column.
+        """
+        rid = _to_uuid(run_id)
         result = await self._session.execute(
-            select(RunRecord).where(RunRecord.run_id == run_id)
+            select(Run).where(Run.id == rid)
         )
         record = result.scalar_one_or_none()
         if record is None:
-            logger.warning("run_update_not_found", run_id=run_id)
+            logger.warning("run_update_not_found", run_id=str(rid))
             return
 
         if status is not None:
-            record.status = status
+            record.status = status.upper()
         if completed_at is not None:
             record.completed_at = completed_at
         if error is not None:
@@ -87,11 +202,12 @@ class RunRepository:
         if total_cost_usd is not None:
             record.total_cost_usd = total_cost_usd
 
-        logger.debug("run_status_updated", run_id=run_id, status=status)
+        logger.debug("run_status_updated", run_id=str(rid), status=record.status)
 
-    async def get(self, run_id: str) -> RunRecord | None:
+    async def get(self, run_id: "uuid.UUID | str") -> Run | None:
+        rid = _to_uuid(run_id)
         result = await self._session.execute(
-            select(RunRecord).where(RunRecord.run_id == run_id)
+            select(Run).where(Run.id == rid)
         )
         return result.scalar_one_or_none()
 
@@ -102,38 +218,49 @@ class RunRepository:
         Called at pipeline startup. Cleans up runs left in intermediate states
         by a previous process that was killed (Ctrl+C, OOM, crash).
         Returns number of runs cleaned up.
+
+        Uses started_at when populated, else requested_at — the unified Run
+        table mixes both populated-at-trigger-time and populated-at-start-time
+        timestamps.
         """
-        _TERMINAL = ["complete", "failed"]
+        from sqlalchemy import func
+        when_col = func.coalesce(Run.started_at, Run.requested_at)
         result = await self._session.execute(
-            select(RunRecord)
-            .where(RunRecord.status.not_in(_TERMINAL))
-            .where(RunRecord.started_at < cutoff)
+            select(Run)
+            .where(Run.status.not_in(_TERMINAL_STATUSES))
+            .where(when_col < cutoff)
         )
         records = list(result.scalars().all())
         now = datetime.now(UTC)
         for record in records:
             stuck_status = record.status  # capture before overwriting
-            record.status = "failed"
+            record.status = "FAILED"
             record.error = "Process interrupted — run orphaned (previous process killed or crashed)"
             record.completed_at = now
+            anchor = record.started_at or record.requested_at
             logger.warning(
                 "orphaned_run_marked_failed",
-                run_id=record.run_id,
+                run_id=str(record.id),
                 stuck_at=stuck_status,
-                started_at=record.started_at.isoformat() if record.started_at else None,
+                started_at=anchor.isoformat() if anchor else None,
             )
         return len(records)
 
-    async def list_recent(self, limit: int = 20) -> list[RunRecord]:
+    async def list_recent(self, limit: int = 20) -> list[Run]:
         """Return the most recent real runs, newest first.
 
         Rows with trigger_type="test" (written by integration tests) are
         excluded so they never pollute the user-facing list-runs output.
+
+        Ordered by COALESCE(started_at, requested_at) so daemon-path runs
+        not yet started, and standalone runs, both sort correctly.
         """
+        from sqlalchemy import func
+        order_col = func.coalesce(Run.started_at, Run.requested_at)
         result = await self._session.execute(
-            select(RunRecord)
-            .where(RunRecord.trigger_type != "test")
-            .order_by(RunRecord.started_at.desc())
+            select(Run)
+            .where((Run.trigger_type != "test") | (Run.trigger_type.is_(None)))
+            .order_by(order_col.desc())
             .limit(limit)
         )
         return list(result.scalars().all())
@@ -141,13 +268,90 @@ class RunRepository:
     async def get_last_successful_completed_at(self) -> "datetime | None":
         """Return completed_at of the most recent successful (non-test) run."""
         result = await self._session.execute(
-            select(RunRecord.completed_at)
-            .where(RunRecord.status == "complete")
-            .where(RunRecord.trigger_type != "test")
-            .order_by(RunRecord.completed_at.desc())
+            select(Run.completed_at)
+            .where(Run.status == "COMPLETE")
+            .where((Run.trigger_type != "test") | (Run.trigger_type.is_(None)))
+            .order_by(Run.completed_at.desc())
             .limit(1)
         )
         return result.scalar_one_or_none()
+
+    # ── Daemon-only intent transition helpers (formerly IntentRepository) ───
+    # These keep the V2 daemon's state-machine code working unchanged.
+
+    async def pick_next_pending(self) -> "Run | None":
+        """Return the oldest PENDING_START run, or None."""
+        result = await self._session.execute(
+            select(Run)
+            .where(Run.status == "PENDING_START")
+            .order_by(Run.requested_at.asc())
+            .limit(1)
+        )
+        return result.scalars().first()
+
+    async def mark_starting(self, run: Run) -> None:
+        run.status = "STARTING"
+        run.picked_up_at = datetime.now(UTC)
+
+    async def mark_running(self, run: Run, *, run_id: "uuid.UUID | str | None" = None) -> None:
+        """Transition to RUNNING. `run_id` kwarg is accepted for backward
+        compatibility with the legacy IntentRepository signature — it's
+        redundant now that intent.id == run.id, and is ignored if it matches
+        the row's id."""
+        if run_id is not None:
+            rid = _to_uuid(run_id)
+            if rid != run.id:
+                logger.warning(
+                    "mark_running_runid_mismatch",
+                    expected=str(run.id), got=str(rid),
+                )
+        run.status = "RUNNING"
+
+    async def mark_complete(self, run: Run) -> None:
+        run.status = "COMPLETE"
+        run.completed_at = datetime.now(UTC)
+
+    async def mark_failed(
+        self, run: Run, *, reason: str, error: str | None = None,
+    ) -> None:
+        run.status = "FAILED"
+        run.failure_reason = reason
+        run.error = error
+        run.completed_at = datetime.now(UTC)
+
+    async def mark_cancelled(self, run: Run) -> None:
+        """Graceful cancellation terminal state."""
+        run.status = "CANCELLED"
+        run.completed_at = datetime.now(UTC)
+
+    async def get_cancel_signal_for(self, run_id: "uuid.UUID | str") -> str | None:
+        """Returns 'graceful' (PENDING_STOP), 'force' (PENDING_FORCE_STOP), or None.
+
+        The daemon polls this between stages to check for user-issued cancel.
+        """
+        rid = _to_uuid(run_id)
+        result = await self._session.execute(
+            select(Run.status).where(Run.id == rid)
+        )
+        status = result.scalar_one_or_none()
+        if status == "PENDING_STOP":
+            return "graceful"
+        if status == "PENDING_FORCE_STOP":
+            return "force"
+        return None
+
+    async def find_orphans(self, daemon_id: str) -> "list[Run]":
+        """Return runs in STARTING/RUNNING state — assumed orphaned at daemon startup.
+
+        For V1 single-daemon-per-DB assumption, all non-terminal runs are
+        considered orphans. The `daemon_id` parameter is reserved for future
+        multi-daemon support and currently ignored by the query.
+        """
+        result = await self._session.execute(
+            select(Run)
+            .where(Run.status.in_(["STARTING", "RUNNING"]))
+        )
+        return list(result.scalars().all())
 
 
 # ── Agent artifact repository ─────────────────────────────────────────────────
@@ -470,10 +674,11 @@ class RunEventRepository:
     async def save(self, event: RunEvent) -> None:
         self._session.add(event)
 
-    async def list_for_run(self, run_id: str) -> list[RunEvent]:
+    async def list_for_run(self, run_id: "uuid.UUID | str") -> list[RunEvent]:
+        rid = _to_uuid(run_id)
         result = await self._session.execute(
             select(RunEvent)
-            .where(RunEvent.run_id == run_id)
+            .where(RunEvent.run_id == rid)
             .order_by(RunEvent.created_at)
         )
         return list(result.scalars().all())
@@ -489,20 +694,21 @@ class RunDigestRepository:
 
     async def save(self, digest: RunDigestRecord) -> None:
         self._session.add(digest)
-        logger.debug("digest_saved", run_id=digest.run_id)
+        logger.debug("digest_saved", run_id=str(digest.run_id))
 
-    async def get_by_run_id(self, run_id: str) -> RunDigestRecord | None:
+    async def get_by_run_id(self, run_id: "uuid.UUID | str") -> RunDigestRecord | None:
+        rid = _to_uuid(run_id)
         result = await self._session.execute(
-            select(RunDigestRecord).where(RunDigestRecord.run_id == run_id)
+            select(RunDigestRecord).where(RunDigestRecord.run_id == rid)
         )
         return result.scalar_one_or_none()
 
     async def get_latest(self) -> RunDigestRecord | None:
-        # Join run_records to exclude test runs — same filter as list_recent().
+        # Join unified runs to exclude test runs — same filter as list_recent().
         result = await self._session.execute(
             select(RunDigestRecord)
-            .join(RunRecord, RunRecord.run_id == RunDigestRecord.run_id)
-            .where(RunRecord.trigger_type != "test")
+            .join(Run, Run.id == RunDigestRecord.run_id)
+            .where((Run.trigger_type != "test") | (Run.trigger_type.is_(None)))
             .order_by(RunDigestRecord.created_at.desc())
             .limit(1)
         )
@@ -637,88 +843,6 @@ class TradeJournalRepository:
         return result.scalar_one_or_none() is not None
 
 
-# ── Run Intent repository (M33 / V2) ────────────────────────────────────────
-
-
-class IntentRepository:
-    """Persists and transitions RunIntent rows.
-
-    The local ChiveDaemon polls for PENDING_START intents via pick_next_pending,
-    transitions them through STARTING → RUNNING → COMPLETE/FAILED, and watches
-    for user-issued cancel signals via get_cancel_signal_for.
-    """
-
-    def __init__(self, session: AsyncSession) -> None:
-        self._session = session
-
-    async def pick_next_pending(self) -> "RunIntent | None":
-        """Return the oldest PENDING_START intent, or None."""
-        from chive_shared.storage.models import RunIntent
-        result = await self._session.execute(
-            select(RunIntent)
-            .where(RunIntent.status == "PENDING_START")
-            .order_by(RunIntent.requested_at.asc())
-            .limit(1)
-        )
-        return result.scalars().first()
-
-    async def mark_starting(self, intent: "RunIntent") -> None:
-        intent.status = "STARTING"
-        intent.picked_up_at = datetime.now(UTC)
-
-    async def mark_running(self, intent: "RunIntent", *, run_id: str) -> None:
-        intent.status = "RUNNING"
-        intent.run_id = run_id
-
-    async def mark_complete(self, intent: "RunIntent") -> None:
-        intent.status = "COMPLETE"
-        intent.completed_at = datetime.now(UTC)
-
-    async def mark_failed(
-        self, intent: "RunIntent", *,
-        reason: str, error: str | None = None,
-    ) -> None:
-        intent.status = "FAILED"
-        intent.failure_reason = reason
-        intent.error = error
-        intent.completed_at = datetime.now(UTC)
-
-    async def mark_cancelled(self, intent: "RunIntent") -> None:
-        """Graceful cancellation terminal state."""
-        intent.status = "CANCELLED"
-        intent.completed_at = datetime.now(UTC)
-
-    async def get_cancel_signal_for(self, intent_id: str) -> str | None:
-        """Returns 'graceful' (PENDING_STOP), 'force' (PENDING_FORCE_STOP), or None.
-
-        The daemon polls this between stages to check for user-issued cancel.
-        """
-        from chive_shared.storage.models import RunIntent
-        result = await self._session.execute(
-            select(RunIntent.status).where(RunIntent.id == intent_id)
-        )
-        status = result.scalar_one_or_none()
-        if status == "PENDING_STOP":
-            return "graceful"
-        if status == "PENDING_FORCE_STOP":
-            return "force"
-        return None
-
-    async def find_orphans(self, daemon_id: str) -> "list[RunIntent]":
-        """Return intents in STARTING/RUNNING state — assumed orphaned at daemon startup.
-
-        For V1 single-daemon-per-DB assumption, all non-terminal intents are
-        considered orphans. The `daemon_id` parameter is reserved for future
-        multi-daemon support and currently ignored by the query.
-        """
-        from chive_shared.storage.models import RunIntent
-        result = await self._session.execute(
-            select(RunIntent)
-            .where(RunIntent.status.in_(["STARTING", "RUNNING"]))
-        )
-        return list(result.scalars().all())
-
-
 # ── Daemon Status repository (M33 / V2) ─────────────────────────────────────
 
 
@@ -770,3 +894,13 @@ class DaemonStatusRepository:
             select(DaemonStatus).where(DaemonStatus.daemon_id == daemon_id)
         )
         return result.scalar_one_or_none()
+
+
+# ── Backwards-compatibility aliases (v0.4.0 unified-runs refactor) ───────────
+# IntentRepository was merged into RunRepository (the daemon-state-machine
+# helpers — pick_next_pending, mark_starting/running/complete/failed,
+# get_cancel_signal_for, find_orphans — are now methods on RunRepository).
+# This alias lets the V2 daemon code keep its `IntentRepository` import
+# working until M35 step 3 updates it.
+IntentRepository = RunRepository
+RunIntentRepository = RunRepository
