@@ -37,7 +37,7 @@ from sqlalchemy import (
     UniqueConstraint,
     text,
 )
-from sqlalchemy.dialects.postgresql import ARRAY, JSON, UUID
+from sqlalchemy.dialects.postgresql import ARRAY, JSON, JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -389,3 +389,33 @@ class DaemonStatus(Base):
 # (M35 steps 2-5).
 RunIntent = Run
 RunRecord = Run
+
+
+class ChartSnapshot(Base):
+    """One row per (run, ticker) — persists OHLCV bars + indicators + annotations
+    the pipeline analyzed during a run, so the chive-web Digest tab can render
+    interactive Lightweight Charts that match exactly what CHIVE saw.
+
+    Bars are a JSON array of {t, o, h, l, c, v}; indicators is a free-form JSON
+    object the pipeline chooses (e.g. ma_50, ma_200, vwap, atr); annotations
+    likewise (distribution_days, pivot_price, stage, etc).
+    """
+
+    __tablename__ = "chart_snapshots"
+
+    run_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("runs.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    ticker: Mapped[str] = mapped_column(String(16), primary_key=True)
+    bars: Mapped[list] = mapped_column(JSONB, nullable=False)
+    indicators: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb"),
+    )
+    annotations: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb"),
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=text("now()"),
+    )

@@ -30,12 +30,17 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from sqlalchemy import delete, select
+from sqlalchemy.dialects import postgresql
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+# sa_select alias used by ChartSnapshotRepository (matches plan spec convention)
+sa_select = select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from chive_shared.storage.models import (
     AgentArtifact,
     ApiCall,
+    ChartSnapshot,
     DataProvenance,
     Run,
     RunDigestRecord,
@@ -894,6 +899,51 @@ class DaemonStatusRepository:
             select(DaemonStatus).where(DaemonStatus.daemon_id == daemon_id)
         )
         return result.scalar_one_or_none()
+
+
+# ── Chart snapshot repository (M36) ──────────────────────────────────────────
+
+
+class ChartSnapshotRepository:
+    """Persists OHLCV bars + indicators + annotations per (run, ticker)."""
+
+    def __init__(self, session: AsyncSession) -> None:
+        self.session = session
+
+    async def upsert(self, snapshot: ChartSnapshot) -> None:
+        """Insert or replace the snapshot for (run_id, ticker)."""
+        stmt = (
+            postgresql.insert(ChartSnapshot)
+            .values(
+                run_id=snapshot.run_id,
+                ticker=snapshot.ticker,
+                bars=snapshot.bars,
+                indicators=snapshot.indicators,
+                annotations=snapshot.annotations,
+            )
+            .on_conflict_do_update(
+                index_elements=["run_id", "ticker"],
+                set_=dict(
+                    bars=snapshot.bars,
+                    indicators=snapshot.indicators,
+                    annotations=snapshot.annotations,
+                ),
+            )
+        )
+        await self.session.execute(stmt)
+
+    async def get(self, run_id: uuid.UUID, ticker: str) -> ChartSnapshot | None:
+        stmt = sa_select(ChartSnapshot).where(
+            ChartSnapshot.run_id == run_id,
+            ChartSnapshot.ticker == ticker,
+        )
+        result = await self.session.execute(stmt)
+        return result.scalar_one_or_none()
+
+    async def list_for_run(self, run_id: uuid.UUID) -> list[ChartSnapshot]:
+        stmt = sa_select(ChartSnapshot).where(ChartSnapshot.run_id == run_id)
+        result = await self.session.execute(stmt)
+        return list(result.scalars().all())
 
 
 # ── Backwards-compatibility aliases (v0.4.0 unified-runs refactor) ───────────
