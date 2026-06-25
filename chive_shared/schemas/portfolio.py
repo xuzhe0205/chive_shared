@@ -17,6 +17,15 @@ class LargestPosition(BaseModel):
     pct_of_nav: float
 
 
+class SleeveSummary(BaseModel):
+    """Per-sleeve allocation summary. Populated for v3 portfolios only."""
+    sleeve: str  # 'core' | 'speculative_growth' | 'tactical'
+    target_pct: float
+    actual_pct: float
+    total_value_usd: float
+    position_count: int
+
+
 class HoldingsSummary(BaseModel):
     portfolio: str
     total_value_usd: float
@@ -25,6 +34,9 @@ class HoldingsSummary(BaseModel):
     largest_position: LargestPosition | None
     top_movers: list[HoldingMover]
     data_as_of: datetime
+    # M41-T13 — v3-only fields (None for v2 portfolios)
+    schema_version: int = 2
+    sleeve_summary: list[SleeveSummary] | None = None
 
 
 class JournalTrade(BaseModel):
