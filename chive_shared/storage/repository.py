@@ -346,7 +346,19 @@ class RunRepository:
         return None
 
     async def find_orphans(self, daemon_id: str) -> "list[Run]":
-        """Return runs in STARTING/RUNNING state — assumed orphaned at daemon startup.
+        """Return all non-terminal runs — assumed orphaned at daemon startup.
+
+        Covers two orphan classes that both need cleanup when the daemon
+        crashes or is killed:
+
+        - **Executing orphans** (STARTING, RUNNING) — a run was mid-execution
+          when the daemon died. Caller should mark FAILED (`daemon_died_mid_run`).
+        - **Stopping orphans** (PENDING_STOP, STOPPING, PENDING_FORCE_STOP) —
+          the user requested cancellation but the daemon died before completing
+          the transition to a terminal state. Caller should mark CANCELLED
+          (user's intent was cancellation; honor it).
+
+        Caller inspects `run.status` to route to the correct terminal state.
 
         For V1 single-daemon-per-DB assumption, all non-terminal runs are
         considered orphans. The `daemon_id` parameter is reserved for future
@@ -354,7 +366,10 @@ class RunRepository:
         """
         result = await self._session.execute(
             select(Run)
-            .where(Run.status.in_(["STARTING", "RUNNING"]))
+            .where(Run.status.in_([
+                "STARTING", "RUNNING",
+                "PENDING_STOP", "STOPPING", "PENDING_FORCE_STOP",
+            ]))
         )
         return list(result.scalars().all())
 
