@@ -163,6 +163,9 @@ class RunDigestRecord(Base):
     chain_dossiers: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
     longitudinal_fund_dossiers: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
     narrative_dossier: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    # M46-ext — run-over-run delta (categorized drops from prior run's
+    # action items, with deterministic evidence + LLM synthesis)
+    run_diff: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     session_type: Mapped[str] = mapped_column(String(20), nullable=False, default="manual")
     action_item_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     created_at: Mapped[datetime] = mapped_column(
